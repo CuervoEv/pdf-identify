@@ -1,13 +1,15 @@
 import fitz
-from config import settings
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("PDF_FILLER")
 
 class PDFFormFiller:
     def __init__(self, pdf_path):
         self.doc = fitz.open(pdf_path)
-        self.scale_x = None
-        self.scale_y = None
-        # CALIBRACIÓN: -2 o -3 suele ser el punto dulce para subir el texto
-        self.Y_TWEAK = -2 
+        # Ajuste vertical global: empuja todo el texto ligeramente hacia arriba
+        # desde la línea base para que no toque la raya del cuadro.
+        self.BOTTOM_MARGIN = 2 
 
     def _normalize_id(self, field_id):
         if not field_id: return ""
@@ -17,61 +19,77 @@ class PDFFormFiller:
         if page_num >= len(self.doc): return
         page = self.doc[page_num]
         
-        if self.scale_x is None or self.scale_y is None:
-            width, height = page.rect.width, page.rect.height
-            self.scale_x = width / 1000.0
-            self.scale_y = height / 1000.0
+        # Dimensiones de la página real
+        page_w = page.rect.width
+        page_h = page.rect.height
+        
+        # Gemini devuelve coordenadas normalizadas (0 a 1000). Calculamos factores.
+        scale_x = page_w / 1000.0
+        scale_y = page_h / 1000.0
 
         normalized_data = {self._normalize_id(k): v for k, v in data.items()}
 
         for field in fields:
             fid = self._normalize_id(field.get("id", ""))
             value = normalized_data.get(fid)
-            
+
+            # Si no hay valor o es nulo, saltamos
             if value is None or str(value).strip().lower() in ["none", "null", ""]:
                 continue
 
-            # 1. Coordenadas base escaladas
-            x_pdf = (float(field.get("x", 0)) * self.scale_x) + 3 # +3 de margen izquierdo
-            y_top = (float(field.get("y", 0)) * self.scale_y)
-            h_pdf = float(field.get("h", 15)) * self.scale_y
-            w_pdf = float(field.get("w", 20)) * self.scale_x
-
-            is_checkbox = field.get("tipo") == "checkbox" or str(value).lower() in ["x", "1", "si", "sí", "true"]
-
-            if is_checkbox:
-                # Centro exacto para la X
-                self._draw_mark(page, x_pdf + (w_pdf/2) - 3, y_top + (h_pdf/2), w_pdf, h_pdf)
-            else:
-                # 2. CÁLCULO DE PRECISIÓN VERTICAL
-                # En lugar de usar un porcentaje fijo, calculamos el baseline
-                # para que el texto quede centrado verticalmente.
-                f_size = float(field.get("fontSize", 9))
+            # Obtener coordenadas
+            try:
+                # box_2d viene usualmente como [ymin, xmin, ymax, xmax] de Gemini
+                # Asegúrate de cómo tu parser convierte esto a x, y, w, h.
+                # Asumiré que en tu 'field' ya tienes x, y, w, h procesados.
                 
-                # Fórmula: Top + (Altura del cuadro / 2) + (Tamaño fuente / 3) + Ajuste Global
-                # Esto sitúa la base de la letra justo donde debe estar para que se vea centrada.
-                y_baseline = y_top + (h_pdf / 2) + (f_size / 3) + self.Y_TWEAK
+                fx = float(field.get("x", 0)) * scale_x
+                fy = float(field.get("y", 0)) * scale_y
+                fw = float(field.get("w", 0)) * scale_x
+                fh = float(field.get("h", 0)) * scale_y
+            except Exception:
+                continue
 
-                self._draw_text(page, x_pdf, y_baseline, str(value), f_size)
+            # Checkbox
+            if field.get("tipo") == "checkbox" or str(value).lower() in ["x", "si", "sí", "true"]:
+                # La X sí va centrada geométricamente
+                cx = fx + (fw / 2)
+                cy = fy + (fh / 2)
+                self._draw_mark(page, cx, cy, min(fw, fh))
+                continue
 
-    def _draw_text(self, page, x, y, text, font_size):
-        """Dibuja el texto de forma directa y visible."""
-        page.insert_text(
-            fitz.Point(x, y),
-            text,
-            fontsize=font_size,
-            fontname="helv",
-            color=(0, 0, 0),
-            overlay=True # Asegura que el texto esté por encima de cualquier capa
-        )
+            # --- LÓGICA DE TEXTO DEFINITIVA: ANCLAJE INFERIOR ---
+            # 1. Calculamos el tamaño de fuente dinámico basado en la altura del renglón.
+            #    Usamos el 60% de la altura del cuadro, con un tope máximo de 9pt.
+            calc_font_size = fh * 0.6
+            font_size = min(max(calc_font_size, 5), 9) 
 
-    def _draw_mark(self, page, x, y, w, h):
-        """Dibuja una X centrada."""
-        size = min(w, h) * 0.35
-        page.draw_line((x - size, y - size), (x + size, y + size), color=(0,0,0), width=1.3)
-        page.draw_line((x - size, y + size), (x + size, y - size), color=(0,0,0), width=1.3)
+            # 2. Definimos la coordenada Y. 
+            #    En lugar de (fy + fh/2) que es el centro, usamos la BASE del cuadro (fy + fh).
+            #    Restamos un margen (BOTTOM_MARGIN) para que no pise la línea.
+            y_base = (fy + fh) - self.BOTTOM_MARGIN
+            
+            # Ajuste de seguridad: Si Gemini detectó el encabezado, el cuadro es muy alto.
+            # Forzamos que el texto vaya al tercio inferior.
+            if fh > 18: 
+                y_base = (fy + fh) - 3
+
+            # 3. Escribimos
+            page.insert_text(
+                fitz.Point(fx + 2, y_base), # fx + 2 da un pequeño margen izquierdo
+                str(value),
+                fontsize=font_size,
+                fontname="helv",
+                color=(0, 0, 0)
+            )
+
+    def _draw_mark(self, page, x, y, size):
+        # Dibuja una X limpia
+        s = size * 0.25
+        page.draw_line((x-s, y-s), (x+s, y+s), color=(0,0,0), width=1)
+        page.draw_line((x-s, y+s), (x+s, y-s), color=(0,0,0), width=1)
 
     def save(self, path_or_buffer):
-        self.doc.save(path_or_buffer, garbage=3, deflate=True, clean=True)
+        self.doc.save(path_or_buffer)
         self.doc.close()
         
