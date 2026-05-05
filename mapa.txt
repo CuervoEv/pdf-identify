@@ -1,0 +1,104 @@
+{
+  "fields": [
+    {
+      "id": "razon_social",
+      "tipo": "texto",
+      "x": 16.8,
+      "y": 231.84,
+      "w": 577.92,
+      "h": 11.4,
+      "fontSize": 9,
+      "align": "left"
+    },
+    {
+      "id": "tipo_persona",
+      "tipo": "texto",
+      "x": 16.8,
+      "y": 366.36,
+      "w": 283.44,
+      "h": 11.4,
+      "fontSize": 9,
+      "align": "left"
+    },
+    {
+      "id": "tipo_empresa",
+      "tipo": "texto",
+      "x": 326.28,
+      "y": 366.36,
+      "w": 268.44,
+      "h": 11.4,
+      "fontSize": 9,
+      "align": "left"
+    },
+    {
+      "id": "codigo_ciiu",
+      "tipo": "texto",
+      "x": 16.8,
+      "y": 388.92,
+      "w": 85.32,
+      "h": 26.28,
+      "fontSize": 9,
+      "align": "center"
+    },
+    {
+      "id": "descripcion_ciiu",
+      "tipo": "texto",
+      "x": 102.0,
+      "y": 388.92,
+      "w": 492.72,
+      "h": 26.28,
+      "fontSize": 9,
+      "align": "left"
+    },
+    {
+      "id": "clasificacion_empleado",
+      "tipo": "texto",
+      "x": 16.8,
+      "y": 415.08,
+      "w": 577.92,
+      "h": 22.68,
+      "fontSize": 9,
+      "align": "left"
+    },
+    {
+      "id": "producto_servicio",
+      "tipo": "texto",
+      "x": 16.8,
+      "y": 494.04,
+      "w": 577.92,
+      "h": 27.48,
+      "fontSize": 9,
+      "align": "left"
+    },
+    {
+      "id": "socios_accionistas",
+      "tipo": "texto",
+      "x": 16.8,
+      "y": 580.8,
+      "w": 577.92,
+      "h": 85.68,
+      "fontSize": 8,
+      "align": "left"
+    },
+    {
+      "id": "pep_pregunta_1",
+      "tipo": "texto",
+      "x": 16.8,
+      "y": 676.56,
+      "w": 577.92,
+      "h": 29.52,
+      "fontSize": 9,
+      "align": "left"
+    },
+    {
+      "id": "pep_pregunta_2",
+      "tipo": "texto",
+      "x": 16.8,
+      "y": 705.96,
+      "w": 577.92,
+      "h": 33.12,
+      "fontSize": 9,
+      "align": "left"
+    }
+  ]
+}
