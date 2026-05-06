@@ -1,5 +1,7 @@
 import os
 import json
+import gc
+import logging
 import uvicorn
 from io import BytesIO
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -16,9 +18,12 @@ load_dotenv()
 app = FastAPI()
 TEMP_DIR = "temp"
 os.makedirs(TEMP_DIR, exist_ok=True)
+logger = logging.getLogger(__name__)
 
 @app.post("/fill-document")
 async def fill_document(file: UploadFile = File(...), json_data: str = Form(...)):
+    input_path = None
+    images_pages = []
     try:
         data = json.loads(json_data)
         input_path = os.path.join(TEMP_DIR, f"in_{file.filename}")
@@ -29,7 +34,7 @@ async def fill_document(file: UploadFile = File(...), json_data: str = Form(...)
         converter = ImageConverter()
         gemini = GeminiVisionService()
         filler = PDFFormFiller(input_path)
-        
+
         images_pages = converter.pdf_to_images(input_path)
         all_keys = list(data.keys())
 
@@ -46,9 +51,13 @@ async def fill_document(file: UploadFile = File(...), json_data: str = Form(...)
             else:
                 # Evita que Gemini confunda la tabla PEP con la de Accionistas
                 keys_for_page = [k for k in all_keys if "accionista" not in k.lower()]
-            
-            # Analizar solo con las llaves permitidas para esta página
-            detected_fields = gemini.analyze_form_page(img, keys_for_page)
+
+            detected_fields = gemini.analyze_form_page(
+                img,
+                keys_for_page,
+                page_num=p_num,
+                debug_dir=TEMP_DIR,
+            )
             
             if detected_fields:
                 print(f"[MAIN] Página {p_num}: {len(detected_fields)} campos detectados.")
@@ -56,13 +65,13 @@ async def fill_document(file: UploadFile = File(...), json_data: str = Form(...)
             else:
                 print(f"[WARNING] Página {p_num}: No se detectaron campos.")
 
+            if hasattr(img, "close"):
+                img.close()
+
         # Generar salida
         buffer = BytesIO()
         filler.save(buffer)
         buffer.seek(0)
-        
-        if os.path.exists(input_path):
-            os.remove(input_path)
 
         headers = {
             "Content-Disposition": f"attachment; filename=filled_{file.filename}",
@@ -74,7 +83,26 @@ async def fill_document(file: UploadFile = File(...), json_data: str = Form(...)
     except Exception as e:
         print(f"❌ ERROR: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        gc.collect()
+
+        for img, _ in images_pages:
+            try:
+                if hasattr(img, "close"):
+                    img.close()
+            except OSError as close_err:
+                logger.warning("No se pudo cerrar imagen temporal: %s", close_err)
+
+        if input_path and os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except (PermissionError, OSError) as cleanup_err:
+                logger.warning(
+                    "No se pudo eliminar temporal '%s': %s",
+                    input_path,
+                    cleanup_err,
+                )
 
 if __name__ == "__main__":
-    uvicorn.run("src.main:app", host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run("src.main:app", host="0.0.0.0", port=8000, reload=True)
     
