@@ -8,6 +8,12 @@ from pdf2image import convert_from_path
 
 class ImageConverter:
     @staticmethod
+    def _is_valid_poppler_bin(path: str | None) -> bool:
+        if not path or not os.path.isdir(path):
+            return False
+        return all(os.path.isfile(os.path.join(path, exe)) for exe in ("pdftoppm.exe", "pdfinfo.exe"))
+
+    @staticmethod
     def _resolve_poppler_path() -> str | None:
         """
         Devuelve la ruta de Poppler si es necesaria.
@@ -15,8 +21,18 @@ class ImageConverter:
         """
         # 1) Prioridad: variable de entorno explícita
         poppler_env_path = os.getenv("POPPLER_PATH")
-        if poppler_env_path and os.path.isdir(poppler_env_path):
+        if ImageConverter._is_valid_poppler_bin(poppler_env_path):
             return poppler_env_path
+
+        # 1.1) Rutas locales comunes cuando Poppler viene embebido en el proyecto
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        local_candidates = [
+            os.path.join(project_root, "poppler", "Library", "bin"),
+            os.path.join(project_root, "poppler", "bin"),
+        ]
+        for candidate in local_candidates:
+            if ImageConverter._is_valid_poppler_bin(candidate):
+                return candidate
 
         # 2) Si los binarios están en PATH, no se necesita ruta fija
         if shutil.which("pdftoppm") and shutil.which("pdfinfo"):

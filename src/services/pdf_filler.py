@@ -1,27 +1,46 @@
 import fitz
 import logging
 
-# Configuración básica de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PDF_FILLER")
 
 class PDFFormFiller:
     def __init__(self, pdf_path):
-        """Inicializa el documento y configura márgenes."""
         try:
             self.doc = fitz.open(pdf_path)
-            self.BOTTOM_MARGIN = 1.2 # Ajuste fino para que el texto descanse sobre la línea
         except Exception as e:
             logger.error(f"Error al abrir el PDF: {e}")
             raise e
 
     def _normalize_id(self, field_id):
-        """Estandariza los IDs para coincidir con los datos de entrada."""
         if not field_id: return ""
         return str(field_id).strip().lower().replace(" ", "_").replace("-", "_")
 
+    def _calcular_baseline(self, fy, fh, f_size):
+        """
+        Calcula la línea base tipográfica correcta.
+        
+        En PyMuPDF, insert_text usa la línea base (baseline) como punto Y.
+        El texto visible ocupa aproximadamente:
+          - 70% del fontSize ENCIMA de la baseline (ascendentes)
+          - 30% del fontSize DEBAJO de la baseline (descendentes)
+        
+        Queremos que el texto quede CENTRADO verticalmente dentro del campo,
+        ligeramente bajado para que visualmente descanse sobre la línea.
+        """
+        # Centro vertical del campo
+        centro = fy + (fh / 2)
+        # La baseline va al 60% del campo para que el texto quede centrado visualmente
+        # (el ojo percibe el texto más centrado cuando la baseline está ligeramente abajo del centro)
+        baseline = fy + (fh * 0.72)
+        
+        # Seguridad: nunca salir del campo
+        baseline = min(baseline, fy + fh - 1.0)
+        baseline = max(baseline, fy + f_size * 0.7)
+        
+        return baseline
+
     def fill_page(self, page_num, fields, data, debug=True):
-        """Llena los campos detectados en la página especificada."""
         if page_num >= len(self.doc):
             return
 
@@ -33,7 +52,7 @@ class PDFFormFiller:
         for field in fields:
             fid = self._normalize_id(field.get("id", ""))
             value = normalized_data.get(fid)
-            
+
             if value is None or str(value).strip().lower() in ["none", "null", ""]:
                 continue
 
@@ -46,32 +65,30 @@ class PDFFormFiller:
             except (ValueError, TypeError):
                 continue
 
-            # MODO DEBUG: Dibuja los recuadros rojos vistos en tus logs
-            if debug:
-                rect_debug = fitz.Rect(fx, fy, fx + fw, fy + fh)
-                page.draw_rect(rect_debug, color=(1, 0, 0), width=0.3, dashes=[1, 1])
+            # Ignorar campos que Gemini no encontró (w=0 o h=0)
+            if fw < 1 or fh < 1:
+                logger.warning(f"Campo '{fid}' ignorado: dimensiones inválidas w={fw} h={fh}")
+                continue
 
-            # Manejo de Checkboxes
+            # MODO DEBUG: dos puntos rojos como anclas visuales
+            if debug:
+                r1 = fitz.Rect(fx - 1.5, fy - 1.5, fx + 1.5, fy + 1.5)
+                r2 = fitz.Rect(fx + fw - 1.5, fy - 1.5, fx + fw + 1.5, fy + 1.5)
+                page.draw_oval(r1, color=(1, 0, 0), fill=(1, 0, 0))
+                page.draw_oval(r2, color=(1, 0, 0), fill=(1, 0, 0))
+
+            # CHECKBOXES
             if field.get("tipo") == "checkbox" or str(value).lower() in ["x", "si", "sí", "true"]:
-                cx, cy = fx + (fw / 2), fy + (fh / 2)
+                cx = fx + (fw / 2)
+                cy = fy + (fh / 2)
                 self._draw_mark(page, cx, cy, min(fw, fh))
                 continue
 
-            # --- LÓGICA DE ALINEACIÓN SEGÚN TIPO DE CAMPO ---
-            aspect_ratio = fw / fh if fh > 0 else 1
-            
-            if fh < 15:
-                # Campos de fecha o muy cortos: anclaje casi al fondo
-                y_baseline = fy + fh - 1.5 
-            elif aspect_ratio > 3.0:
-                # Campos largos (Razón Social): bajar texto al 85% de la caja
-                y_baseline = fy + (fh * 0.85)
-            else:
-                # Tablas: forzar al borde inferior para evitar títulos grises
-                y_baseline = (fy + fh) - self.BOTTOM_MARGIN
+            # TEXTO — baseline calculada correctamente
+            y_baseline = self._calcular_baseline(fy, fh, f_size)
 
             page.insert_text(
-                fitz.Point(fx + 1.5, y_baseline), 
+                fitz.Point(fx + 1.5, y_baseline),
                 str(value),
                 fontsize=f_size,
                 fontname="helv",
@@ -79,17 +96,16 @@ class PDFFormFiller:
             )
 
     def _draw_mark(self, page, x, y, size):
-        """Dibuja una marca X en las coordenadas indicadas."""
-        s = size * 0.25
-        page.draw_line((x-s, y-s), (x+s, y+s), color=(0,0,0), width=0.8)
-        page.draw_line((x-s, y+s), (x+s, y-s), color=(0,0,0), width=0.8)
+        """Dibuja una X centrada en el checkbox."""
+        s = min(size * 0.3, 4.0)  # máximo 4pt para no desbordar
+        page.draw_line((x-s, y-s), (x+s, y+s), color=(0, 0, 0), width=0.8)
+        page.draw_line((x-s, y+s), (x+s, y-s), color=(0, 0, 0), width=0.8)
 
     def save(self, path_or_buffer):
-        """Guarda el archivo y libera recursos."""
         try:
             self.doc.save(path_or_buffer, garbage=3, deflate=True)
             self.doc.close()
-            logger.info("PDF procesado y guardado correctamente.")
+            logger.info("PDF guardado correctamente.")
         except Exception as e:
             logger.error(f"Error al guardar: {e}")
             raise e
