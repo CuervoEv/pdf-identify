@@ -2,23 +2,284 @@ import os
 import time
 import json
 from pathlib import Path
-from PIL import ImageDraw
+from PIL import Image, ImageDraw
 from google import genai
 from src.utils.image_annotator import agregar_grilla
+
 
 class GeminiVisionService:
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise ValueError("API KEY no detectada. Usa GOOGLE_API_KEY o GEMINI_API_KEY.")
-        
         self.client = genai.Client(api_key=api_key)
         self.model_id = "gemini-3-flash-preview"
 
+    # ─────────────────────────────────────────────
+    # GRILLA CON COORDENADAS ABSOLUTAS DE LA FRANJA
+    # ─────────────────────────────────────────────
+
+    def _agregar_grilla_franja(self, image_pil, y_ini, y_fin):
+        """
+        Dibuja una grilla sobre el recorte mostrando los valores
+        REALES de coordenadas absolutas de la página completa.
+        Eje X: siempre 0-1000.
+        Eje Y: valores reales entre y_ini y y_fin.
+        """
+        img  = image_pil.copy().convert("RGB")
+        draw = ImageDraw.Draw(img)
+        w, h = img.size
+        rango = y_fin - y_ini
+
+        for i in range(0, 1001, 100):
+            # Eje X
+            x_px = int((i / 1000) * w)
+            draw.line([(x_px, 0), (x_px, h)], fill=(180, 180, 180), width=1)
+            draw.text((x_px + 2, 2), str(i), fill=(220, 50, 50))
+
+            # Eje Y — valor absoluto real
+            y_px   = int((i / 1000) * h)
+            y_real = round(y_ini + (i / 1000) * rango)
+            draw.line([(0, y_px), (w, y_px)], fill=(180, 180, 180), width=1)
+            draw.text((2, y_px + 2), str(y_real), fill=(220, 50, 50))
+
+        return img
+
+    # ─────────────────────────────────────────────
+    # UTILIDADES
+    # ─────────────────────────────────────────────
+
+    def _deduplicar(self, campos):
+        """Conserva una sola ocurrencia por id, priorizando la de mayor área."""
+        mapa = {}
+        for campo in campos:
+            fid = campo.get("id")
+            if not fid:
+                continue
+            if campo.get("w", 0) == 0 and campo.get("h", 0) == 0:
+                continue
+            area_nueva  = campo.get("w", 0) * campo.get("h", 0)
+            area_actual = mapa[fid].get("w", 0) * mapa[fid].get("h", 0) if fid in mapa else -1
+            if fid not in mapa or area_nueva > area_actual:
+                mapa[fid] = campo
+        return list(mapa.values())
+
+    def _recortar_franja(self, image_pil, y_ini, y_fin):
+        """Recorta la imagen entre y_ini y y_fin (escala 0-1000 → píxeles)."""
+        w, h   = image_pil.size
+        top    = int((y_ini / 1000) * h)
+        bottom = int((y_fin  / 1000) * h)
+        return image_pil.crop((0, top, w, bottom))
+
+    def _llamar_gemini(self, imagen_pil, prompt, retries=3, delay=2):
+        """Llama a Gemini con reintentos ante errores 503."""
+        for attempt in range(1, retries + 1):
+            try:
+                return self.client.models.generate_content(
+                    model=self.model_id,
+                    contents=[prompt, imagen_pil],
+                )
+            except Exception as e:
+                err = str(e)
+                if ("503" in err or "UNAVAILABLE" in err.upper()) and attempt < retries:
+                    print(f"[Gemini] 503 (intento {attempt}/{retries}). Reintentando en {delay}s...")
+                    time.sleep(delay)
+                else:
+                    raise
+
+    # ─────────────────────────────────────────────
+    # FRANJAS con solapamiento de 100 unidades y rangos de 200
+    # ─────────────────────────────────────────────
+
+    FRANJAS = [
+        (0, 200),
+        (100, 300),
+        (200, 400),
+        (300, 500),
+        (400, 600),
+        (500, 700),
+        (600, 800),
+        (700, 900),
+        (800, 1000),
+    ]
+
+    def _procesar_por_franjas(self, image_pil, expected_fields, debug_dir, page_num):
+        todos_los_campos = []
+
+        for idx, (y_ini, y_fin) in enumerate(self.FRANJAS):
+            print(f"[Gemini] Franja {idx+1}/{len(self.FRANJAS)} → y:{y_ini}-{y_fin}")
+
+            recorte = self._recortar_franja(image_pil, y_ini, y_fin)
+            recorte_con_grilla = self._agregar_grilla_franja(recorte, y_ini, y_fin)
+
+            prompt = self._construir_prompt(expected_fields, y_ini, y_fin)
+
+            try:
+                response   = self._llamar_gemini(recorte_con_grilla, prompt)
+                clean_json = response.text.replace("```json", "").replace("```", "").strip()
+                parsed     = json.loads(clean_json)
+                fields     = parsed.get("fields", [])
+
+                # Filtrar campos fuera del rango de la franja
+                fields_validos = []
+                for f in fields:
+                    fy  = f.get("y", 0)
+                    fh  = f.get("h", 0)
+                    if fy < y_ini or (fy + fh) > y_fin:
+                        # Corregir si está ligeramente fuera por redondeo
+                        f["y"] = max(y_ini, min(fy, y_fin - 1))
+                        f["h"] = min(fh, y_fin - f["y"])
+                    fields_validos.append(f)
+
+                print(f"[Gemini] Franja {idx+1}: {len(fields_validos)} campos.")
+                todos_los_campos.extend(fields_validos)
+
+                # Guardar JSON de cada franja para debug
+                Path(debug_dir).mkdir(parents=True, exist_ok=True)
+                suffix = f"_page_{page_num}" if page_num is not None else ""
+                franja_path = Path(debug_dir) / f"franja_{idx+1}{suffix}.json"
+                franja_path.write_text(
+                    json.dumps(parsed, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+
+            except Exception as e:
+                print(f"[Gemini] Franja {idx+1} falló: {e}")
+                continue
+
+        deduplicados = self._deduplicar(todos_los_campos)
+        print(f"[Gemini] Total tras deduplicar: {len(deduplicados)} campos únicos.")
+
+        # Guardar JSON consolidado
+        output_path = Path(debug_dir) / f"gemini_response_page_{page_num}.json"
+        output_path.write_text(
+            json.dumps({"fields": deduplicados}, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+
+        return deduplicados
+
+    # ─────────────────────────────────────────────
+    # PROMPT con contexto de franja
+    # ─────────────────────────────────────────────
+
+    def _construir_prompt(self, expected_fields, y_ini, y_fin):
+        return f"""
+ROL: Eres un sistema OCR especializado en formularios en papel.
+Tu ÚNICA función es localizar zonas VACÍAS de escritura, no texto impreso.
+
+TAREA: Localizar las coordenadas de llenado para estos campos: {expected_fields}
+
+═══════════════════════════════════════════════════════════
+CALIBRACIÓN DE ESCALA — LEE ESTO ANTES DE CUALQUIER COSA
+═══════════════════════════════════════════════════════════
+Esta imagen es una FRANJA de la página completa.
+La grilla visible tiene números rojos que muestran coordenadas ABSOLUTAS reales:
+  → Eje X: 0 a 1000 (izquierda a derecha de la página completa)
+  → Eje Y: {y_ini} a {y_fin} (posición real dentro de la página completa)
+
+USA los números de la grilla directamente como tus coordenadas.
+NUNCA reportes Y fuera del rango {y_ini}-{y_fin}.
+NUNCA reportes X fuera del rango 0-1000.
+
+═══════════════════════════════════════════════════════════
+PRINCIPIO FUNDAMENTAL
+═══════════════════════════════════════════════════════════
+Un campo de llenado es SIEMPRE un espacio vacío, nunca texto impreso.
+
+SEÑALES de que SÍ es un campo:
+  → Espacio en blanco después de una etiqueta
+  → Línea fina horizontal impresa (_____)
+  → Recuadro con borde fino y vacío por dentro
+  → Texto gris claro o subrayado (placeholder)
+
+SEÑALES de que NO es un campo:
+  → Texto en negrita o con color → es una ETIQUETA, ignórala
+  → Título de sección o encabezado de columna
+  → Texto ya impreso dentro de un recuadro
+
+═══════════════════════════════════════════════════════════
+CADENA DE RAZONAMIENTO — APLICA A CADA CAMPO
+═══════════════════════════════════════════════════════════
+  [1] ¿Dónde está la etiqueta de este campo en la imagen?
+  [2] ¿Qué hay inmediatamente DESPUÉS o DEBAJO de esa etiqueta?
+  [3] ¿Ese espacio está vacío? → Sí: úsalo. No: busca el siguiente vacío.
+  [4] ¿Las coordenadas caen sobre espacio blanco? → Sí: reporta. No: corrige.
+
+═══════════════════════════════════════════════════════════
+REGLAS POR TIPO
+═══════════════════════════════════════════════════════════
+CHECKBOXES:
+  → x,y = esquina superior izquierda de la figura vacía (cuadrado o círculo).
+  → w = h, entre 12 y 20. Nunca más de 22.
+  → Grupo en fila → mismo 'y', distinto 'x'.
+
+FECHAS (dd / mm / aaaa):
+  → 3 campos separados, mismo 'y', distinto 'x'.
+  → dd: w 30-50 | mm: w 30-50 | aaaa: w 60-90 | h: 10-16.
+  → (y + h) toca la línea base impresa.
+
+TEXTO CORTO:   w 30-80,   h 10-18
+TEXTO MEDIO:   w 80-350,  h 10-20
+TEXTO LARGO:   w 300-970, h 10-22
+NÚMERO:        w 50-200,  h 10-18
+
+═══════════════════════════════════════════════════════════
+ALINEACIÓN
+═══════════════════════════════════════════════════════════
+  → Misma fila → mismo 'y' (±5), distinto 'x'.
+  → Filas distintas → 'y' diferente (mínimo 10 unidades).
+  → Nunca (x + w) > 1000.
+  → Nunca (y + h) > {y_fin}.
+
+═══════════════════════════════════════════════════════════
+AUTO-REVISIÓN ANTES DE RESPONDER
+═══════════════════════════════════════════════════════════
+  [A] ¿Algún campo cae sobre texto en negrita? → muévelo al vacío adyacente.
+  [B] ¿Algún checkbox con w o h > 22? → reduce a máximo 20.
+  [C] ¿Dos campos distintos con mismo 'y'? → corrige el segundo.
+  [D] ¿Algún (x+w) > 1000 o (y+h) > {y_fin}? → recorta.
+  [E] ¿Algún campo con 'y' fuera de {y_ini}-{y_fin}? → corrige o descarta.
+  [F] ¿Faltan campos de {expected_fields}? → agrégalos con w=0, h=0.
+
+═══════════════════════════════════════════════════════════
+EJEMPLO CORRECTO
+═══════════════════════════════════════════════════════════
+Campo 'ciudad_solicitud':
+  [1] Etiqueta "Ciudad" en negrita → es la etiqueta, no el campo.
+  [2] Debajo hay espacio en blanco con línea fina.
+  [3] Vacío ✓  [4] Cae en blanco ✓
+  → x:248, y:128, w:222, h:25
+
+Campo 'solicitud_nuevo_chk':
+  [1] Etiqueta "Nuevo" a la izquierda del cuadro.
+  [2] A la derecha hay cuadro pequeño con borde fino vacío.
+  [3] Vacío ✓  [4] Cae en blanco ✓
+  → x:574, y:148, w:17, h:17
+
+═══════════════════════════════════════════════════════════
+RESPONDE SOLO CON JSON, sin markdown, sin texto adicional:
+═══════════════════════════════════════════════════════════
+{{
+  "fields": [
+    {{
+      "id": "nombre_campo",
+      "tipo": "texto",
+      "x": 100, "y": 200, "w": 150, "h": 14,
+      "fontSize": 9,
+      "align": "left"
+    }}
+  ]
+}}
+"""
+
+    # ─────────────────────────────────────────────
+    # TWO-PASS: VERIFICACIÓN
+    # ─────────────────────────────────────────────
+
     def _verificar_y_corregir(self, image_pil, fields_detectados):
         try:
-            img_anotada = image_pil.copy().convert("RGBA")
-            draw = ImageDraw.Draw(img_anotada, "RGBA")
+            img_anotada  = image_pil.copy().convert("RGBA")
+            draw         = ImageDraw.Draw(img_anotada, "RGBA")
             w_img, h_img = img_anotada.size
 
             for field in fields_detectados:
@@ -35,172 +296,55 @@ class GeminiVisionService:
                     y1 = max(0, int((y / 1000) * h_img))
                     x2 = min(w_img - 1, int(((x + w) / 1000) * w_img))
                     y2 = min(h_img - 1, int(((y + h) / 1000) * h_img))
-                    fill    = (0, 180, 0, 70)    if tipo == "checkbox" else (220, 30, 30, 70)
-                    outline = (0, 160, 0, 255)   if tipo == "checkbox" else (220, 30, 30, 255)
+                    fill    = (0, 180, 0, 70)  if tipo == "checkbox" else (220, 30, 30, 70)
+                    outline = (0, 160, 0, 255) if tipo == "checkbox" else (220, 30, 30, 255)
                     draw.rectangle([(x1, y1), (x2, y2)], fill=fill, outline=outline, width=2)
                     draw.text((x1 + 2, y1 + 2), fid[:12], fill=(255, 255, 255, 255))
                 except Exception:
                     continue
 
-            prompt_verificacion = f"""
-Eres un verificador de precisión de coordenadas en formularios.
+            prompt_v = f"""
+Eres un verificador de coordenadas en formularios.
+Rectángulos rojos = campo de texto. Verdes = checkbox.
 
-En la imagen ves rectángulos de colores sobre un formulario:
-- Rojo = campo de texto detectado
-- Verde = checkbox detectado
+Verifica si cada rectángulo cubre ÚNICAMENTE espacio vacío de escritura.
+Si cubre texto impreso o etiqueta en negrita → está MAL.
 
-TAREA: Revisar si cada rectángulo está posicionado sobre el ESPACIO VACÍO 
-de escritura (no sobre texto impreso, etiquetas en negrita ni títulos).
+Para cada campo:
+- CORRECTO → mismas coordenadas
+- MAL → coordenadas corregidas al espacio vacío real
+- NO ENCONTRADO → w=0, h=0
 
-REGLA CLAVE: Un rectángulo correcto cubre únicamente el área en blanco 
-donde un humano escribiría. Si cubre texto impreso, está mal.
+Coordenadas 0-1000. NUNCA fuera de rango.
+Campos: {[f.get('id') for f in fields_detectados]}
 
-Para cada campo devuelve:
-- CORRECTO → mismas coordenadas sin cambios
-- MAL POSICIONADO → coordenadas corregidas al espacio vacío real
-- NO ENCONTRADO → w=0 y h=0
-
-SISTEMA DE COORDENADAS: 0 a 1000. x=0 izquierda, y=0 arriba.
-NUNCA valores fuera de 0-1000.
-
-Campos a verificar: {[f.get('id') for f in fields_detectados]}
-
-Responde SOLO con JSON estricto, sin markdown:
+JSON estricto sin markdown:
 {{
   "fields": [
-    {{
-      "id": "nombre_campo",
-      "tipo": "texto",
-      "x": 100, "y": 200, "w": 150, "h": 14,
-      "fontSize": 9,
-      "align": "left"
-    }}
+    {{"id":"...","tipo":"...","x":0,"y":0,"w":0,"h":0,"fontSize":9,"align":"left"}}
   ]
 }}
 """
-            response = self.client.models.generate_content(
-                model=self.model_id,
-                contents=[prompt_verificacion, img_anotada.convert("RGB")],
-            )
-            clean = response.text.replace("```json", "").replace("```", "").strip()
+            response   = self._llamar_gemini(img_anotada.convert("RGB"), prompt_v)
+            clean      = response.text.replace("```json", "").replace("```", "").strip()
             corregidos = json.loads(clean).get("fields", [])
             print(f"[Gemini][2pass] {len(corregidos)} campos verificados.")
             return corregidos if isinstance(corregidos, list) and corregidos else fields_detectados
 
         except Exception as e:
-            print(f"[Gemini][2pass] Falló verificación, usando detección original: {e}")
+            print(f"[Gemini][2pass] Falló, usando detección original: {e}")
             return fields_detectados
 
+    # ─────────────────────────────────────────────
+    # PUNTO DE ENTRADA PRINCIPAL
+    # ─────────────────────────────────────────────
+
     def analyze_form_page(self, image_pil, expected_fields, page_num=None, debug_dir="temp"):
-        imagen_con_grilla = agregar_grilla(image_pil)
+        # Paso 1: detección por franjas
+        fields = self._procesar_por_franjas(image_pil, expected_fields, debug_dir, page_num)
 
-        prompt = f"""
-ROL: Eres un sistema OCR especializado en formularios en papel. 
-Tu ÚNICA función es localizar zonas vacías de escritura, no texto impreso.
+        # Paso 2: two-pass verificación sobre imagen completa
+        fields = self._verificar_y_corregir(image_pil, fields)
+        print(f"[Gemini] Final: {len(fields)} campos tras verificación.")
 
-TAREA: Localiza las coordenadas de las zonas de llenado para: {expected_fields}
-
-▸ CALIBRACIÓN DE ESCALA (obligatorio leer primero):
-  La imagen tiene marcadores de grilla visibles (líneas grises con números rojos).
-  Esos números son tu sistema de coordenadas: 0 a 1000 horizontal, 0 a 1000 vertical.
-  Úsalos como regla de medición. NUNCA reportes valores fuera de 0-1000.
-
-▸ PRINCIPIO FUNDAMENTAL:
-  Un campo de llenado es un ESPACIO VACÍO, no texto impreso.
-  El texto en NEGRITA o con color es siempre una ETIQUETA — NUNCA es un campo.
-  El texto gris claro o subrayado puede ser un placeholder — es un campo.
-  Una línea horizontal fina (___) es siempre la base de un campo de texto.
-  Un cuadro con borde fino y vacío es siempre un campo o checkbox.
-
-▸ REGLA 1 — CAMPOS DE TEXTO:
-  SEÑALES de que SÍ es un campo: espacio en blanco, línea base (___), fondo claro sin texto bold.
-  SEÑALES de que NO es un campo: texto en negrita, texto con color, título de sección.
-  POSICIÓN: el campo está siempre DESPUÉS o DEBAJO de su etiqueta, nunca encima ni sobre ella.
-  (y + h) debe quedar exactamente sobre la línea base impresa.
-
-▸ REGLA 2 — CHECKBOXES:
-  Localiza ÚNICAMENTE la figura geométrica vacía (cuadrado o círculo con borde).
-  x, y apuntan a la esquina superior izquierda de ESA figura, no al texto adyacente.
-  w y h iguales entre sí, entre 12 y 20 unidades. Nunca más de 22.
-  Grupo de checkboxes en fila → mismo 'y', cada uno con su propia 'x'.
-
-▸ REGLA 3 — FECHAS (dd / mm / aaaa):
-  Son 3 campos separados, mismo 'y', distinto 'x'.
-  dd → w 30-50 | mm → w 30-50 | aaaa → w 60-90
-  h entre 10-16. El campo va ENCIMA de la línea, nunca debajo.
-
-▸ REGLA 4 — ALINEACIÓN:
-  Misma fila visual → mismo 'y' (±5), distinto 'x'.
-  Filas distintas → 'y' diferente (mínimo 10 unidades de diferencia).
-  Nunca (x + w) > 1000. Nunca (y + h) > 1000.
-
-▸ LÍMITES DE TAMAÑO:
-  checkbox:        w=h, 12-20
-  fecha dd/mm:     w 30-55,   h 10-16
-  fecha aaaa:      w 60-90,   h 10-16
-  texto corto:     w 30-80,   h 10-18
-  texto medio:     w 80-350,  h 10-20
-  texto largo:     w 300-970, h 10-22
-  número/código:   w 50-200,  h 10-18
-
-▸ COMPLETITUD:
-  Reporta TODOS los campos de {expected_fields}.
-  Si no encuentras uno → w=0, h=0. Nunca omitas un campo.
-
-RESPONDE SOLO CON JSON, sin markdown, sin texto adicional:
-{{
-  "fields": [
-    {{
-      "id": "nombre_campo",
-      "tipo": "texto",
-      "x": 100, "y": 200, "w": 150, "h": 14,
-      "fontSize": 9,
-      "align": "left"
-    }}
-  ]
-}}
-"""
-
-        try:
-            MAX_RETRIES = 3
-            RETRY_DELAY_S = 2
-            response = None
-
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    response = self.client.models.generate_content(
-                        model=self.model_id,
-                        contents=[prompt, imagen_con_grilla],
-                    )
-                    break
-                except Exception as api_error:
-                    err_text = str(api_error)
-                    is_503 = "503" in err_text or "UNAVAILABLE" in err_text.upper()
-                    if is_503 and attempt < MAX_RETRIES:
-                        print(f"[Gemini] 503 (intento {attempt}/{MAX_RETRIES}). Reintentando en {RETRY_DELAY_S}s...")
-                        time.sleep(RETRY_DELAY_S)
-                        continue
-                    raise
-
-            clean_json = response.text.replace("```json", "").replace("```", "").strip()
-            parsed = json.loads(clean_json)
-            fields = parsed.get("fields", [])
-
-            print(f"[Gemini] Paso 1: {len(fields)} campos detectados.")
-            print(json.dumps(parsed, indent=2, ensure_ascii=False))
-
-            Path(debug_dir).mkdir(parents=True, exist_ok=True)
-            suffix = f"_page_{page_num}" if page_num is not None else ""
-            output_path = Path(debug_dir) / f"gemini_response{suffix}.json"
-            output_path.write_text(
-                json.dumps(parsed, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-
-            # Two-pass: verificar y corregir con segunda llamada
-            fields = self._verificar_y_corregir(image_pil, fields)
-            print(f"[Gemini] Paso 2: {len(fields)} campos después de verificación.")
-
-            return fields
-
-        except Exception as e:
-            raise RuntimeError(f"Error crítico en Gemini página {page_num}: {e}") from e
+        return fields
