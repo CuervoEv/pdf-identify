@@ -1,165 +1,284 @@
-import fitz
-import json
-import sys
-from pathlib import Path
+import fitz  # PyMuPDF
+from collections import Counter
+import os
+import tempfile
+import pythoncom
+import win32com.client
+from win32com.client import constants
+import time
 
-from PIL import Image, ImageDraw
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-TEMP_DIR = SCRIPT_DIR / "temp"
-
-PDFS = {
-    1: SCRIPT_DIR / "Prueba-1.pdf",
-    2: SCRIPT_DIR / "Prueba-2.pdf",
-    3: SCRIPT_DIR / "Prueba-3.pdf",
-}
-
-
-def detectar_escala_gemini(campos):
+def convert_pdf_to_word_temp(pdf_path):
     """
-    Detecta automáticamente si Gemini devolvió píxeles o escala 0-1000.
-    Si el valor máximo supera 1000, se asume espacio en píxeles del raster de página.
+    Convierte PDF a Word temporalmente para extraer información de formato
     """
-    derechas = []
-    bajos = []
-    for c in campos:
-        try:
-            x = float(c.get("x", 0))
-            y = float(c.get("y", 0))
-            w = float(c.get("w", 0))
-            h = float(c.get("h", 0))
-        except (TypeError, ValueError):
-            continue
-        derechas.append(x + w)
-        bajos.append(y + h)
-    if not derechas or not bajos:
-        return 1000.0, 1000.0
-    return max(derechas), max(bajos)
-
-
-def generar_imagen_mapeada(pdf_original, archivo_json, imagen_salida, num_pagina=0, dpi=150):
-    doc = fitz.open(pdf_original)
-    pagina = doc[num_pagina]
-    pix = pagina.get_pixmap(dpi=dpi)
-
-    modo = "RGBA" if pix.alpha else "RGB"
-    imagen = Image.frombytes(modo, [pix.width, pix.height], pix.samples)
-    dibujo = ImageDraw.Draw(imagen)
-
-    img_w, img_h = imagen.size
-    print(f"📐 Imagen renderizada: {img_w} × {img_h} px")
-
-    raw = Path(archivo_json).read_text(encoding="utf-8").strip()
-    if not raw:
-        print(f"❌ El JSON está vacío: {archivo_json}")
-        doc.close()
-        return
     try:
-        datos = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"❌ JSON inválido en {archivo_json}: {e}")
-        doc.close()
-        return
-
-    campos = datos.get("fields", [])
-    if not campos:
-        print("❌ No hay campos en el JSON")
-        doc.close()
-        return
-
-    # Detectar qué escala usó Gemini
-    max_x, max_y = detectar_escala_gemini(campos)
-    print(f"🔍 Valor máximo detectado: x={max_x:.0f}, y={max_y:.0f}")
-
-    if max_x > 1000 or max_y > 1000:
-        # Coordenadas en píxeles del mismo tamaño de página que esta imagen
-        div_x, div_y = float(img_w), float(img_h)
-        print(f"⚠️  Modo PÍXELES detectado → divisores: {div_x:.0f} × {div_y:.0f} (tamaño imagen)")
-    else:
-        # Escala normalizada 0-1000 del pipeline
-        div_x, div_y = 1000.0, 1000.0
-        print("✅ Modo 0-1000 detectado")
-
-    for campo in campos:
+        pythoncom.CoInitialize()
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = False
+        
+        # Crear documento temporal
+        temp_doc = tempfile.NamedTemporaryFile(suffix=".docx", delete=False)
+        temp_doc.close()
+        
+        # Abrir PDF en Word (Word puede abrir PDFs directamente)
+        doc = word.Documents.Open(os.path.abspath(pdf_path))
+        
+        # Guardar como Word
+        doc.SaveAs2(temp_doc.name, FileFormat=constants.wdFormatXMLDocument)
+        
+        # Extraer información de formato
+        font_info = extract_font_info_from_word(word, doc)
+        
+        # Cerrar sin guardar cambios
+        doc.Close(SaveChanges=False)
+        word.Quit()
+        
+        # Limpiar
+        del word
+        pythoncom.CoUninitialize()
+        
+        # Eliminar archivo temporal
         try:
-            cx = float(campo.get("x", 0))
-            cy = float(campo.get("y", 0))
-            cw = float(campo.get("w", 0))
-            ch = float(campo.get("h", 0))
-        except (TypeError, ValueError):
-            continue
-        if cw <= 0 or ch <= 0:
-            continue
-        x0 = (cx / div_x) * img_w
-        y0 = (cy / div_y) * img_h
-        w = (cw / div_x) * img_w
-        h = (ch / div_y) * img_h
-        x1, y1 = x0 + w, y0 + h
+            os.unlink(temp_doc.name)
+        except:
+            pass
+        
+        return font_info
+        
+    except Exception as e:
+        print(f"  Error con conversión Word: {e}")
+        try:
+            word.Quit()
+        except:
+            pass
+        pythoncom.CoUninitialize()
+        return None
 
-        color = (0, 180, 0) if campo.get("tipo") == "checkbox" else (220, 30, 30)
-        dibujo.rectangle([x0, y0, x1, y1], outline=color, width=2)
-        dibujo.text((x0 + 2, y0 + 1), campo.get("id", "?")[:15], fill=color)
+def extract_font_info_from_word(word, doc):
+    """
+    Extrae información de fuente del documento de Word
+    """
+    try:
+        # Analizar primeros párrafos
+        fonts = []
+        font_sizes = []
+        
+        for paragraph in doc.Paragraphs:
+            if paragraph.Range.Text.strip():
+                # Obtener fuente del párrafo
+                try:
+                    font_name = paragraph.Range.Font.Name
+                    font_size = paragraph.Range.Font.Size
+                    
+                    if font_name and font_name != "":
+                        fonts.append(font_name)
+                    if font_size and font_size > 0:
+                        font_sizes.append(font_size)
+                except:
+                    pass
+        
+        # También revisar caracteres individuales para más precisión
+        for char in doc.Range().Characters:
+            if char.Text.strip():
+                try:
+                    font_name = char.Font.Name
+                    font_size = char.Font.Size
+                    
+                    if font_name and font_name != "":
+                        fonts.append(font_name)
+                    if font_size and font_size > 0:
+                        font_sizes.append(font_size)
+                except:
+                    pass
+        
+        if fonts and font_sizes:
+            # Fuente más común
+            most_common_font = Counter(fonts).most_common(1)[0][0]
+            # Tamaño más pequeño (excluyendo 0)
+            smallest_size = min([s for s in font_sizes if s > 0])
+            
+            return {
+                'font': most_common_font,
+                'smallest_size': smallest_size,
+                'all_sizes': list(set(font_sizes)),
+                'all_fonts': list(set(fonts))
+            }
+        
+    except Exception as e:
+        print(f"  Error extrayendo formato: {e}")
+    
+    return None
 
-    imagen.save(imagen_salida)
+def detect_font_and_size_from_pdf(pdf_path):
+    """
+    Detecta fuente y tamaño directamente del PDF
+    """
+    doc = fitz.open(pdf_path)
+    
+    fonts = []
+    font_sizes = []
+    
+    print("\n🔍 Detectando fuentes y tamaños del PDF...")
+    
+    for page_num in range(min(3, len(doc))):  # Primeras 3 páginas
+        page = doc[page_num]
+        words = page.get_text_words()
+        
+        for word in words:
+            if len(word) > 8:
+                font_size = word[8]
+                font_name = word[10] if len(word) > 10 else "unknown"
+                
+                if font_size > 0:
+                    font_sizes.append(round(font_size, 1))
+                if font_name and font_name != "unknown":
+                    fonts.append(font_name)
+    
     doc.close()
-    print(f"✅ Imagen guardada: {imagen_salida}")
+    
+    if fonts and font_sizes:
+        # Fuente más común
+        most_common_font = Counter(fonts).most_common(1)[0][0]
+        # Tamaño más pequeño (excluyendo tamaños extremadamente pequeños)
+        smallest_size = min([s for s in font_sizes if s > 3])
+        
+        return {
+            'font': most_common_font,
+            'smallest_size': smallest_size,
+            'all_sizes': sorted(set(font_sizes)),
+            'all_fonts': list(set(fonts))
+        }
+    
+    return None
 
+def add_hola_to_pdf(pdf_path, font_info, output_path="output.pdf"):
+    """
+    Agrega "Hola" al PDF usando la fuente y tamaño detectados
+    """
+    doc = fitz.open(pdf_path)
+    
+    # Mapear nombres de fuentes de Word a fuentes de PyMuPDF
+    font_mapping = {
+        'Arial': 'helv',
+        'Calibri': 'helv',
+        'Times New Roman': 'times',
+        'Times': 'times',
+        'Courier New': 'cour',
+        'Courier': 'cour',
+        'Helvetica': 'helv',
+        'Verdana': 'helv'
+    }
+    
+    # Seleccionar fuente
+    detected_font = font_info.get('font', 'helv')
+    pdf_font = font_mapping.get(detected_font, 'helv')
+    
+    # Usar el tamaño más pequeño detectado
+    font_size = font_info.get('smallest_size', 8)
+    
+    # Ajustar tamaño (a veces Word da tamaños diferentes)
+    # Si el tamaño es muy pequeño (< 5) o muy grande (> 20), ajustar
+    if font_size < 5:
+        font_size = 8
+    elif font_size > 20:
+        font_size = 12
+    
+    print(f"\n✍️ Agregando 'Hola' con:")
+    print(f"  Fuente detectada: {detected_font} -> usando: {pdf_font}")
+    print(f"  Tamaño más pequeño: {font_size} puntos")
+    
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        
+        # Obtener dimensiones
+        page_rect = page.rect
+        page_width = page_rect.width
+        page_height = page_rect.height
+        
+        # Margen de la esquina
+        margin = 20
+        
+        # Calcular posición X ajustada
+        text_width = fitz.get_text_length("Hola", fontsize=font_size, fontname=pdf_font)
+        x_position = page_width - margin - text_width
+        y_position = margin + font_size
+        
+        print(f"\n  Página {page_num+1}:")
+        print(f"    Posición: ({x_position:.1f}, {y_position:.1f})")
+        print(f"    Tamaño: {font_size} puntos")
+        
+        # Insertar texto con la fuente detectada
+        page.insert_text(
+            (x_position, y_position),
+            "Hola",
+            fontsize=font_size,
+            color=(0, 0, 0),
+            fontname=pdf_font,
+            rotate=0
+        )
+    
+    doc.save(output_path)
+    doc.close()
+    print(f"\n✅ PDF guardado como: {output_path}")
 
 def main():
-    """
-    Cada PDF de prueba es de una sola página física.
-    La opción N enlaza Prueba-N.pdf con temp/gemini_response_page_N.json
-    (mapeo generado para esa «página» en el pipeline, no hojas extra en el PDF).
-    Siempre se renderiza la única página del PDF (índice 0) con las coords del JSON elegido.
-    """
-    print("\n=== Elegir visualización (1 = PDF + JSON mismo índice) ===")
-    for k, p in PDFS.items():
-        existe_pdf = p.is_file()
-        json_path = TEMP_DIR / f"gemini_response_page_{k}.json"
-        existe_json = json_path.is_file()
-        estado_pdf = "✓" if existe_pdf else "(falta PDF)"
-        estado_json = "✓" if existe_json else "(falta JSON)"
-        print(
-            f"  {k}) {p.name}  {estado_pdf}  +  temp/gemini_response_page_{k}.json  {estado_json}"
-        )
-
-    raw = input("\nElige (1, 2 o 3): ").strip()
-    if raw not in ("1", "2", "3"):
-        print("❌ Opción inválida. Debe ser 1, 2 o 3.")
+    """Función principal"""
+    import sys
+    
+    # Configurar PDF de entrada
+    if len(sys.argv) > 1:
+        input_pdf = sys.argv[1]
+    else:
+        input_pdf = "prueba-1.pdf"
+    
+    if not os.path.exists(input_pdf):
+        print(f"❌ Error: No se encuentra '{input_pdf}'")
         sys.exit(1)
-    n = int(raw)
-    pdf_path = PDFS[n]
-    json_path = TEMP_DIR / f"gemini_response_page_{n}.json"
-
-    if not pdf_path.is_file():
-        print(f"❌ No existe el archivo: {pdf_path}")
-        sys.exit(1)
-    if not json_path.is_file():
-        print(f"❌ No existe el archivo: {json_path}")
-        sys.exit(1)
-
-    doc = fitz.open(pdf_path)
-    n_pages = len(doc)
-    doc.close()
-    if n_pages < 1:
-        print("❌ El PDF no tiene páginas.")
-        sys.exit(1)
-
-    # PDFs de una sola página: siempre la primera hoja; el JSON trae coords de esa vista.
-    num_pagina_pdf = 0
-
-    salida = SCRIPT_DIR / f"{pdf_path.stem}_mapeada_page{n}.png"
-    print(f"\n📄 PDF (página renderizada: 1 de {n_pages}): {pdf_path.name}")
-    print(f"📋 JSON (página lógica {n}): {json_path.relative_to(SCRIPT_DIR)}")
-    print(f"🖼️  Salida: {salida.name}\n")
-
-    generar_imagen_mapeada(
-        str(pdf_path),
-        str(json_path),
-        str(salida),
-        num_pagina=num_pagina_pdf,
-    )
-
+    
+    print("="*60)
+    print("🎯 DETECTANDO FUENTE Y TAMAÑO DE LETRA")
+    print("="*60)
+    
+    # Método 1: Detectar directamente del PDF
+    pdf_info = detect_font_and_size_from_pdf(input_pdf)
+    
+    if pdf_info:
+        print(f"\n📊 Detección desde PDF:")
+        print(f"  Fuente más común: {pdf_info['font']}")
+        print(f"  Tamaño más pequeño: {pdf_info['smallest_size']} puntos")
+        print(f"  Todos los tamaños: {pdf_info['all_sizes']}")
+        
+        font_info = pdf_info
+    else:
+        print("\n⚠️ No se pudo detectar desde PDF, intentando con Word...")
+        
+        # Método 2: Convertir a Word temporalmente
+        word_info = convert_pdf_to_word_temp(input_pdf)
+        
+        if word_info:
+            print(f"\n📊 Detección desde Word:")
+            print(f"  Fuente más común: {word_info['font']}")
+            print(f"  Tamaño más pequeño: {word_info['smallest_size']} puntos")
+            print(f"  Todos los tamaños: {word_info['all_sizes']}")
+            
+            font_info = word_info
+        else:
+            print("\n⚠️ Usando valores por defecto")
+            font_info = {
+                'font': 'helv',
+                'smallest_size': 8
+            }
+    
+    # Agregar "Hola" al PDF
+    print("\n" + "="*60)
+    base_name = os.path.splitext(input_pdf)[0]
+    output_pdf = f"{base_name}_con_hola.pdf"
+    
+    add_hola_to_pdf(input_pdf, font_info, output_pdf)
+    
+    print("\n" + "="*60)
+    print("✅ PROCESO COMPLETADO")
+    print("="*60)
 
 if __name__ == "__main__":
     main()

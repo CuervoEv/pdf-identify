@@ -101,6 +101,8 @@ async def fill_from_map(file: UploadFile = File(...), mapped_data: str = Form(..
             os.remove(input_path)
 
 
+# ... (Imports iniciales iguales) ...
+
 @app.post("/procesar-formulario")
 async def procesar_formulario(
     pdf: UploadFile = File(...),
@@ -133,8 +135,11 @@ async def procesar_formulario(
             tmp_path = os.path.join(TEMP_DIR, f"procesar_{input_hash}.pdf")
             with open(tmp_path, "wb") as f:
                 f.write(pdf_bytes)
+            
             images_pages = converter.pdf_to_images(tmp_path)
             all_fields = []
+            images_dict = {}  # NUEVO: Diccionario para retener imágenes vivas
+            
             for img, p_num in images_pages:
                 detected = gemini.analyze_form_page(
                     img, list(maestro.keys()), page_num=p_num, debug_dir=TEMP_DIR
@@ -142,16 +147,26 @@ async def procesar_formulario(
                 for d in detected:
                     d["page"] = p_num - 1
                 all_fields.extend(detected)
-                img.close()
+                
+                images_dict[p_num - 1] = img  # Guardar imagen sin cerrar
+
             os.remove(tmp_path)
 
             mapping: MappingResponse = gemini.map_fields_with_master(
                 pdf_bytes, maestro, all_fields, pdf_is_acroform=False
             )
+            
             filler.fill_pdf(
                 [m.model_dump() for m in mapping.mappings],
                 page_mode="overlay",
+                gemini_service=gemini,      # Pasar Gemini para detección de fuente
+                images_by_page=images_dict   # Pasar imágenes para detección visual
             )
+            
+            # Liberar memoria cerrando las imágenes
+            for img in images_dict.values():
+                if hasattr(img, "close"):
+                    img.close()
 
         buffer = BytesIO()
         filler.save(buffer)
@@ -185,7 +200,7 @@ async def procesar_formulario(
         logger.error(f"Error en /procesar-formulario: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
+# ... (resto de endpoints /get-map, /fill-from-map, /health iguales) ...
 @app.get("/health")
 def health():
     return {"status": "ok", "version": app.version}

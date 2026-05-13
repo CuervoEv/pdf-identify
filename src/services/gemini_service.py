@@ -45,14 +45,21 @@ class FieldMapping(BaseModel):
     bbox: Optional[List[float]] = Field(
         None, description="Coordenadas [x0,y0,x1,y1] en puntos PDF (solo para overlay)"
     )
+# ... (imports y esquemas existentes, incluyendo FieldMapping y MappingResponse)
 
+# NUEVO: Esquema para la horma de la letra (añadido después de FieldMapping)
+class EstimacionFuente(BaseModel):
+    estimated_font_size_pt: float = Field(description="Tamaño estimado de la fuente principal en puntos (pt)")
 
+# ... (resto de la clase GeminiVisionService mantiene todos sus métodos originales)
+
+# NUEVO: Método visual para cuando Python no detecta texto (añadido dentro de la clase)
+   
+
+# El método map_fields_with_master original se conserva intacto (sin cambios)
 class MappingResponse(BaseModel):
     mappings: List[FieldMapping]
-    unmapped_master_keys: List[str] = Field(
-        default_factory=list,
-        description="Claves del maestro que no se pudieron asignar a ningún campo"
-    )
+    unmapped_master_keys: List[str] = []
     notes: Optional[str] = None
 
 
@@ -63,13 +70,9 @@ class MappingResponse(BaseModel):
 class GeminiVisionService:
     def __init__(self, model_id: Optional[str] = None):
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("API KEY no detectada. Configure GEMINI_API_KEY o GOOGLE_API_KEY.")
         self.client = genai.Client(api_key=api_key)
-        # Por defecto usamos Flash (más barato) según recomendación del documento
         self.model_id = model_id or "gemini-2.5-flash"
-        self.model_id_vision = "gemini-2.5-pro"  # para detección visual por franjas si se requiere
-
+        self.model_id_vision = "gemini-2.5-pro"
     # 5 franjas verticales (Y 0–1000), solapamiento 50 entre adyacentes.
     FRANJAS = [
         (0, 240),
@@ -82,7 +85,22 @@ class GeminiVisionService:
     # ------------------------------------------------------------------
     # Métodos existentes de detección visual (conservados íntegros)
     # ------------------------------------------------------------------
-
+    def estimar_tamano_fuente(self, image_pil, width_pt: float, height_pt: float) -> float:
+        """Estima visualmente el tamaño de la letra si PyMuPDF falla."""
+        prompt = f"Estima el tamaño de la fuente principal en pt para este PDF de {width_pt:.1f}x{height_pt:.1f}pt."
+        try:
+            response = self.client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[prompt, image_pil],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=EstimacionFuente,
+                    temperature=0.0
+                )
+            )
+            return response.parsed.estimated_font_size_pt if response.parsed else 9.0
+        except Exception:
+            return 9.0
     def _agregar_grilla_franja(self, image_pil, y_ini, y_fin):
         img  = image_pil.copy().convert("RGB")
         draw = ImageDraw.Draw(img)

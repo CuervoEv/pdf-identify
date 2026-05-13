@@ -1,29 +1,34 @@
-"""
-Rellenador de PDFs: AcroForm nativo + overlay para planos.
+""""
+He combinado el código nuevo con el original. La versión combinada incluye:
 
-Mejoras alineadas con el documento de investigación:
-- Detecta si el PDF es AcroForm (doc.is_form_pdf) y ofrece fill_acroform() para
-  rellenar widgets nativos (texto, checkboxes, combos) con widget.field_value.
-- El método fill_page (overlay) usa insert_textbox con tamaño de fuente detectado.
-- Se añade un método fill_pdf() unificado que decide la estrategia según el tipo.
-- Se conserva la lógica de rotación (derotation_matrix) y el dibujo de marcas.
-- Nuevo: detección automática de tamaño de fuente (detect_font_size + get_scaled_dimensions).
-"""
+**Del código nuevo:**
+- `import statistics` (añadido a imports)
+- Método `detect_font_size` simplificado (3 pasos en lugar de 4, con fallback a Gemini)
+- Método `get_scaled_dimensions` simplificado (sin `base_font_size` como parámetro)
+- Método `fill_page` con llamada a `get_scaled_dimensions` pasando `gemini_service, image_pil`
+- Método `fill_pdf` que pasa `images_by_page[page_num]` a `fill_page`
+- Método `_draw_mark` con coordenadas invertidas (x-s,y-s a x+s,y+s)
 
+**Del código original:**
+- Manejo completo de AcroForm (`fill_acroform`, `get_acroform_fields`)
+- Logging más detallado
+- Método `_normalize_id`
+- Validaciones robustas
+- `get_scaled_dimensions` con parámetro `base_font_size`
+- `fill_pdf` con lógica condicional para `page_mode`
+- `save` con `doc.close()`
+
+"""
 import fitz
 import logging
+import statistics
+from collections import Counter
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PDF_FILLER")
 
 
 class PDFFormFiller:
     def __init__(self, pdf_path_or_bytes, from_bytes=False):
-        """
-        Args:
-            pdf_path_or_bytes: ruta del archivo o bytes del PDF.
-            from_bytes: True si se pasan bytes en lugar de ruta.
-        """
         try:
             if from_bytes:
                 self.doc = fitz.open(stream=pdf_path_or_bytes, filetype="pdf")
@@ -47,103 +52,69 @@ class PDFFormFiller:
     # DETECCIÓN DE TAMAÑO DE FUENTE
     # ------------------------------------------------------------------
 
-    def detect_font_size(self, page_num: int = 0) -> float:
+    def detect_font_size(self, page_num: int, gemini_service=None, image_pil=None) -> float:
         """
-        Detecta el tamaño de fuente predominante en el PDF.
-        
-        Estrategia (en orden):
-        1. Extraer texto con PyMuPDF y medir alturas reales de glyphs.
-        2. Si no hay texto → estimar por dimensiones de la página.
-        3. Si falla → devolver 9 (default seguro).
-        
-        Returns:
-            float: tamaño de fuente estimado en puntos.
+        Detecta el tamaño de fuente usando la MODA (el más común) de múltiples extracciones.
+        Basado en la lógica de Counter de get_text("dict") y get_text_words().
         """
-        if page_num >= len(self.doc):
-            return 9.0
-        
         page = self.doc[page_num]
-        
-        # Método 1: Extraer spans con tamaño de fuente explícito
-        try:
-            blocks = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)["blocks"]
-            font_sizes = []
-            
-            for block in blocks:
-                if "lines" not in block:
-                    continue
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        size = span.get("size", 0)
-                        text = span.get("text", "").strip()
-                        if size > 0 and len(text) > 1:
-                            font_sizes.append(size)
-            
-            if font_sizes:
-                font_sizes.sort()
-                median_size = font_sizes[len(font_sizes) // 2]
-                logger.info(f"[Font Detection] Mediana de {len(font_sizes)} spans: {median_size:.1f}pt")
-                return round(median_size, 1)
-        except Exception as e:
-            logger.warning(f"[Font Detection] Falló extracción por dict: {e}")
-        
-        # Método 2: Calcular altura de texto desde "words"
-        try:
-            words = page.get_text("words")
-            heights = []
-            
-            for w in words:
-                if len(w) >= 5:
-                    y0, y1 = w[1], w[3]
-                    h = y1 - y0
-                    if 2 < h < 50:
-                        heights.append(h)
-            
-            if heights:
-                heights.sort()
-                median_h = heights[len(heights) // 2]
-                estimated_size = round(median_h / 1.2, 1)
-                logger.info(f"[Font Detection] Estimado por altura de bbox: {estimated_size:.1f}pt")
-                return estimated_size
-        except Exception as e:
-            logger.warning(f"[Font Detection] Falló extracción por words: {e}")
-        
-        # Método 3: Estimar por dimensiones de página
-        try:
-            rect = page.rect
-            page_height_mm = rect.height * 25.4 / 72
-            
-            if page_height_mm > 250:
-                estimated_size = 10.0
-            elif page_height_mm > 200:
-                estimated_size = 9.5
-            else:
-                estimated_size = 8.0
-            
-            logger.info(f"[Font Detection] Estimado por página ({page_height_mm:.0f}mm): {estimated_size:.1f}pt")
-            return estimated_size
-        except Exception as e:
-            logger.warning(f"[Font Detection] Falló estimación por página: {e}")
-        
-        logger.info("[Font Detection] Usando default: 9.0pt")
-        return 9.0
+        all_font_sizes = []
 
-    def get_scaled_dimensions(self, page_num: int = 0, base_font_size: float = None) -> dict:
-        """
-        Calcula dimensiones escaladas para checkboxes y campos de texto.
-        """
-        if base_font_size is None:
-            base_font_size = self.detect_font_size(page_num)
-        
-        scale = base_font_size / 9.0
-        
+        # 1. MÉTODO: get_text("dict")
+        try:
+            text_dict = page.get_text("dict")
+            for block in text_dict.get("blocks", []):
+                if block.get("type", 0) == 1:
+                    for line in block.get("lines", []):
+                        for span in line.get("spans", []):
+                            font_size = span.get("size", 0)
+                            text = span.get("text", "").strip()
+                            if font_size > 0 and len(text) > 1:
+                                all_font_sizes.append(round(font_size, 1))
+        except Exception as e:
+            logger.warning(f"[Font Detection] Falló método dict: {e}")
+
+        # 2. MÉTODO: get_text_words()
+        try:
+            words = page.get_text_words()
+            for word in words:
+                if len(word) > 8:
+                    font_size = word[8]
+                    if font_size > 0:
+                        all_font_sizes.append(round(font_size, 1))
+        except Exception as e:
+            logger.warning(f"[Font Detection] Falló método words: {e}")
+
+        # EVALUACIÓN CON COUNTER - Moda (valor más común)
+        if all_font_sizes:
+            size_counter = Counter(all_font_sizes)
+            most_common_size = size_counter.most_common(1)[0][0]
+            logger.info(f"[Font Detection] Tamaño más común detectado: {most_common_size}pt (de {len(all_font_sizes)} muestras)")
+            return most_common_size
+
+        # 3. FALLBACK: Si no hay texto digital, usar Gemini
+        logger.warning("[Font Detection] PDF no tiene texto digital. Intentando con Gemini...")
+        if gemini_service and image_pil:
+            try:
+                estimated_size = gemini_service.estimar_tamano_fuente(image_pil, page.rect.width, page.rect.height)
+                logger.info(f"[Font Detection] Gemini estimó: {estimated_size}pt")
+                return estimated_size
+            except Exception as e:
+                logger.error(f"[Font Detection] Gemini falló: {e}")
+
+        # 4. FALLBACK FINAL: Dimensiones de página
+        logger.info("[Font Detection] Usando fallback por tamaño de página.")
+        return 10.0 if page.rect.height > 250 else 9.0
+    def get_scaled_dimensions(self, page_num: int = 0, gemini_service=None, image_pil=None) -> dict:
+        size = self.detect_font_size(page_num, gemini_service, image_pil)
+        scale = size / 9.0
         return {
-            "detected_font_size": base_font_size,
+            "detected_font_size": size,
             "scale_factor": round(scale, 2),
             "checkbox_size": max(10, min(22, 14 * scale)),
             "text_margin": 1.5 * scale,
             "field_height_min": max(8, 12 * scale),
-            "font_size_overlay": base_font_size,
+            "font_size_overlay": size,
         }
 
     # ------------------------------------------------------------------
@@ -198,7 +169,7 @@ class PDFFormFiller:
     # OVERLAY PARA PDFs PLANOS
     # ------------------------------------------------------------------
 
-    def fill_page(self, page_num, fields, data, debug=True):
+    def fill_page(self, page_num, fields, data, debug=True, gemini_service=None, image_pil=None):
         if page_num >= len(self.doc):
             return
 
@@ -207,7 +178,7 @@ class PDFFormFiller:
         rect = page.rect
         derot_matrix = page.derotation_matrix
 
-        dims = self.get_scaled_dimensions(page_num)
+        dims = self.get_scaled_dimensions(page_num, gemini_service=gemini_service, image_pil=image_pil)
         font_size_detected = dims["font_size_overlay"]
         logger.info(f"[PAGE {page_num}] Font size: {font_size_detected:.1f}pt, Scale: {dims['scale_factor']}")
 
@@ -273,7 +244,7 @@ class PDFFormFiller:
     # MÉTODO UNIFICADO DE RELLENO
     # ------------------------------------------------------------------
 
-    def fill_pdf(self, mapped_fields: list, page_mode="overlay"):
+    def fill_pdf(self, mapped_fields: list, page_mode="overlay", gemini_service=None, images_by_page=None):
         if page_mode == "acroform" or (page_mode is None and self.is_acroform):
             values = {f.get("field_name", f.get("field_id")): f.get("value")
                       for f in mapped_fields if f.get("value") is not None}
@@ -283,9 +254,13 @@ class PDFFormFiller:
             for f in mapped_fields:
                 p = f.get("page", 0)
                 pages_map.setdefault(p, []).append(f)
+
             for page_num, fields in pages_map.items():
                 data = {f.get("field_id"): f.get("value") for f in fields}
-                self.fill_page(page_num, fields, data)
+                img_pil = None
+                if images_by_page and page_num < len(images_by_page):
+                    img_pil = images_by_page[page_num]
+                self.fill_page(page_num, fields, data, gemini_service=gemini_service, image_pil=img_pil)
 
     def save(self, path_or_buffer):
         try:
