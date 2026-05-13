@@ -4,6 +4,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PDF_FILLER")
 
+
 class PDFFormFiller:
     def __init__(self, pdf_path):
         try:
@@ -13,40 +14,33 @@ class PDFFormFiller:
             raise e
 
     def _normalize_id(self, field_id):
-        if not field_id: return ""
+        if not field_id:
+            return ""
         return str(field_id).strip().lower().replace(" ", "_").replace("-", "_")
 
     def _calcular_baseline(self, fy, fh, f_size):
-        """
-        Calcula la línea base tipográfica correcta.
-        
-        En PyMuPDF, insert_text usa la línea base (baseline) como punto Y.
-        El texto visible ocupa aproximadamente:
-          - 70% del fontSize ENCIMA de la baseline (ascendentes)
-          - 30% del fontSize DEBAJO de la baseline (descendentes)
-        
-        Queremos que el texto quede CENTRADO verticalmente dentro del campo,
-        ligeramente bajado para que visualmente descanse sobre la línea.
-        """
-        # Centro vertical del campo
-        centro = fy + (fh / 2)
-        # La baseline va al 60% del campo para que el texto quede centrado visualmente
-        # (el ojo percibe el texto más centrado cuando la baseline está ligeramente abajo del centro)
-        baseline = fy + (fh * 0.72)
-        
-        # Seguridad: nunca salir del campo
-        baseline = min(baseline, fy + fh - 1.0)
-        baseline = max(baseline, fy + f_size * 0.7)
-        
-        return baseline
+        """Baseline centrada en el campo, con margen inferior."""
+        y_baseline = fy + (fh / 2) + (f_size / 3)
+        y_baseline = min(y_baseline, fy + fh - 1.0)
+        return y_baseline
 
     def fill_page(self, page_num, fields, data, debug=True):
         if page_num >= len(self.doc):
             return
 
         page = self.doc[page_num]
-        scale_x = page.rect.width / 1000.0
-        scale_y = page.rect.height / 1000.0
+        
+        # --- DIAGNÓSTICO EN CONSOLA ---
+        rotation = page.rotation
+        rect = page.rect
+        # La matriz de rotación inversa para alinear imagen (Gemini) con PDF (PyMuPDF)
+        derot_matrix = page.derotation_matrix 
+
+        logger.info(f"[PAGE {page_num}] Rot: {rotation}, Rect: {rect}, Crop: {page.cropbox}")
+
+        scale_x = rect.width / 1000.0
+        scale_y = rect.height / 1000.0
+        
         normalized_data = {self._normalize_id(k): v for k, v in data.items()}
 
         for field in fields:
@@ -57,49 +51,62 @@ class PDFFormFiller:
                 continue
 
             try:
-                fx = float(field.get("x", 0)) * scale_x
-                fy = float(field.get("y", 0)) * scale_y
+                # 1. Coordenadas y dimensiones visuales (escala 0-1000 -> tamaño visible)
+                lx = float(field.get("x", 0)) * scale_x
+                ly = float(field.get("y", 0)) * scale_y
                 fw = float(field.get("w", 0)) * scale_x
                 fh = float(field.get("h", 0)) * scale_y
                 f_size = float(field.get("fontSize", 8))
-            except (ValueError, TypeError):
+
+                if fw < 1 or fh < 1:
+                    continue
+
+                # ==========================================
+                # RAMA 1: CHECKBOXES Y MARCAS LÓGICAS
+                # ==========================================
+                tipo_campo = str(field.get("tipo", "")).lower()
+                valor_str = str(value).strip().lower()
+
+                if tipo_campo == "checkbox" or valor_str in ["x", "true", "si", "sí"]:
+                    # Calculamos el centro visual
+                    cx = lx + (fw / 2)
+                    cy = ly + (fh / 2)
+                    
+                    # MAGIA MATRICIAL: Traducimos el punto visual al lienzo nativo
+                    punto_check = fitz.Point(cx, cy) * derot_matrix
+                    
+                    # Dibujamos la 'X' usando la función dedicada
+                    self._draw_mark(page, punto_check.x, punto_check.y, min(fw, fh))
+                    continue
+
+                # ==========================================
+                # RAMA 2: INSERCIÓN DE TEXTO
+                # ==========================================
+                # Construimos la caja visual donde Gemini vio el espacio
+                caja_visual = fitz.Rect(lx + 1.5, ly, lx + fw - 1.5, ly + fh)
+
+                # MAGIA MATRICIAL: Traducimos la caja entera al espacio nativo del PDF
+                caja_real = caja_visual * derot_matrix
+
+                # Insertamos el texto
+                page.insert_textbox(
+                    caja_real,
+                    str(value),
+                    fontsize=f_size,
+                    fontname="helv",
+                    color=(0, 0, 0),
+                    align=0,  # 0=Izquierda, 1=Centro, 2=Derecha
+                    rotate=rotation  # Compensa la rotación para que se lea horizontalmente
+                )
+
+            except Exception as e:
+                logger.error(f"Error en campo {fid}: {e}")
                 continue
-
-            # Ignorar campos que Gemini no encontró (w=0 o h=0)
-            if fw < 1 or fh < 1:
-                logger.warning(f"Campo '{fid}' ignorado: dimensiones inválidas w={fw} h={fh}")
-                continue
-
-            # MODO DEBUG: dos puntos rojos como anclas visuales
-            if debug:
-                r1 = fitz.Rect(fx - 1.5, fy - 1.5, fx + 1.5, fy + 1.5)
-                r2 = fitz.Rect(fx + fw - 1.5, fy - 1.5, fx + fw + 1.5, fy + 1.5)
-                page.draw_oval(r1, color=(1, 0, 0), fill=(1, 0, 0))
-                page.draw_oval(r2, color=(1, 0, 0), fill=(1, 0, 0))
-
-            # CHECKBOXES
-            if field.get("tipo") == "checkbox" or str(value).lower() in ["x", "si", "sí", "true"]:
-                cx = fx + (fw / 2)
-                cy = fy + (fh / 2)
-                self._draw_mark(page, cx, cy, min(fw, fh))
-                continue
-
-            # TEXTO — baseline calculada correctamente
-            y_baseline = self._calcular_baseline(fy, fh, f_size)
-
-            page.insert_text(
-                fitz.Point(fx + 1.5, y_baseline),
-                str(value),
-                fontsize=f_size,
-                fontname="helv",
-                color=(0, 0, 0)
-            )
-
     def _draw_mark(self, page, x, y, size):
         """Dibuja una X centrada en el checkbox."""
         s = min(size * 0.3, 4.0)  # máximo 4pt para no desbordar
-        page.draw_line((x-s, y-s), (x+s, y+s), color=(0, 0, 0), width=0.8)
-        page.draw_line((x-s, y+s), (x+s, y-s), color=(0, 0, 0), width=0.8)
+        page.draw_line((x - s, y - s), (x + s, y + s), color=(0, 0, 0), width=0.8)
+        page.draw_line((x - s, y + s), (x + s, y - s), color=(0, 0, 0), width=0.8)
 
     def save(self, path_or_buffer):
         try:
