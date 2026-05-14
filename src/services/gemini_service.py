@@ -1,18 +1,11 @@
 """
 Servicio de visión y mapeo con Gemini.
-
-Mejoras alineadas con el documento de investigación:
-- Se conserva el motor de detección por franjas (0-1000) para PDFs planos/escaneados.
-- Se añade un nuevo método map_fields_with_master que recibe el PDF nativo,
-  el JSON maestro completo y la lista de campos extraídos, y usa structured output
-  (response_schema + Pydantic) para devolver el mapeo con confidence, source_key y
-  needs_human_review.
-- El modelo por defecto pasa a gemini-2.5-flash (más barato, suficiente para el caso).
 """
 
 import os
 import time
 import json
+import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from PIL import Image, ImageDraw
@@ -22,41 +15,25 @@ from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
-# Schemas Pydantic para structured output (sección 6 del documento)
+# Schemas Pydantic
 # ---------------------------------------------------------------------------
 
 class FieldMapping(BaseModel):
     field_id: str = Field(description="Identificador del campo en el formulario")
     field_label: Optional[str] = Field(None, description="Etiqueta humana del campo")
     value: Optional[str] = Field(None, description="Valor asignado desde la base maestra")
-    source_key: Optional[str] = Field(
-        None, description="Clave del JSON maestro de donde proviene el valor"
-    )
-    confidence: float = Field(
-        ge=0.0, le=1.0, description="Confianza del modelo en la asignación (0-1)"
-    )
-    reasoning: Optional[str] = Field(
-        None, description="Justificación breve de la asignación (para auditoría)"
-    )
-    needs_human_review: bool = Field(
-        False, description="True si confidence < 0.9 o hay ambigüedad"
-    )
+    source_key: Optional[str] = Field(None, description="Clave del JSON maestro de donde proviene el valor")
+    confidence: float = Field(ge=0.0, le=1.0, description="Confianza del modelo en la asignación (0-1)")
+    reasoning: Optional[str] = Field(None, description="Justificación breve de la asignación (para auditoría)")
+    needs_human_review: bool = Field(False, description="True si confidence < 0.9 o hay ambigüedad")
     page: Optional[int] = Field(None, description="Número de página (base 0)")
-    bbox: Optional[List[float]] = Field(
-        None, description="Coordenadas [x0,y0,x1,y1] en puntos PDF (solo para overlay)"
-    )
-# ... (imports y esquemas existentes, incluyendo FieldMapping y MappingResponse)
+    bbox: Optional[List[float]] = Field(None, description="Coordenadas [x0,y0,x1,y1] en puntos PDF")
 
-# NUEVO: Esquema para la horma de la letra (añadido después de FieldMapping)
+
 class EstimacionFuente(BaseModel):
     estimated_font_size_pt: float = Field(description="Tamaño estimado de la fuente principal en puntos (pt)")
 
-# ... (resto de la clase GeminiVisionService mantiene todos sus métodos originales)
 
-# NUEVO: Método visual para cuando Python no detecta texto (añadido dentro de la clase)
-   
-
-# El método map_fields_with_master original se conserva intacto (sin cambios)
 class MappingResponse(BaseModel):
     mappings: List[FieldMapping]
     unmapped_master_keys: List[str] = []
@@ -70,10 +47,12 @@ class MappingResponse(BaseModel):
 class GeminiVisionService:
     def __init__(self, model_id: Optional[str] = None):
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("API KEY no detectada.")
         self.client = genai.Client(api_key=api_key)
         self.model_id = model_id or "gemini-2.5-flash"
         self.model_id_vision = "gemini-2.5-pro"
-    # 5 franjas verticales (Y 0–1000), solapamiento 50 entre adyacentes.
+
     FRANJAS = [
         (0, 240),
         (190, 430),
@@ -83,26 +62,41 @@ class GeminiVisionService:
     ]
 
     # ------------------------------------------------------------------
-    # Métodos existentes de detección visual (conservados íntegros)
+    # ESTIMACIÓN DE TAMAÑO DE FUENTE
     # ------------------------------------------------------------------
+
     def estimar_tamano_fuente(self, image_pil, width_pt: float, height_pt: float) -> float:
-        """Estima visualmente el tamaño de la letra si PyMuPDF falla."""
-        prompt = f"Estima el tamaño de la fuente principal en pt para este PDF de {width_pt:.1f}x{height_pt:.1f}pt."
+        """Estima visualmente el tamaño de la fuente principal."""
+        prompt = (
+            f"Este es un formulario PDF escaneado de {width_pt:.0f}x{height_pt:.0f} puntos. "
+            "Observa el texto impreso y estima el tamaño de fuente en puntos (pt). "
+            "Responde SOLO con un número, por ejemplo: 7.5"
+        )
         try:
             response = self.client.models.generate_content(
                 model="gemini-2.5-flash",
                 contents=[prompt, image_pil],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=EstimacionFuente,
-                    temperature=0.0
-                )
+                config=types.GenerateContentConfig(temperature=0.0)
             )
-            return response.parsed.estimated_font_size_pt if response.parsed else 9.0
-        except Exception:
+            text = response.text.strip() if response.text else ""
+            match = re.search(r'(\d+\.?\d*)', text)
+            if match:
+                size = float(match.group(1))
+                if 4 <= size <= 24:
+                    print(f"[Gemini] Tamaño estimado: {size}pt")
+                    return size
+            print(f"[Gemini] No se pudo extraer tamaño de: '{text[:100]}'")
             return 9.0
+        except Exception as e:
+            print(f"[Gemini] Error: {e}")
+            return 9.0
+
+    # ------------------------------------------------------------------
+    # GRILLA Y ANOTACIONES
+    # ------------------------------------------------------------------
+
     def _agregar_grilla_franja(self, image_pil, y_ini, y_fin):
-        img  = image_pil.copy().convert("RGB")
+        img = image_pil.copy().convert("RGB")
         draw = ImageDraw.Draw(img)
         w, h = img.size
         rango = y_fin - y_ini
@@ -130,13 +124,13 @@ class GeminiVisionService:
         return img
 
     def _anotar_campos_puntos(self, image_pil, fields, y_ini, y_fin):
-        img  = image_pil.copy().convert("RGBA")
+        img = image_pil.copy().convert("RGBA")
         draw = ImageDraw.Draw(img, "RGBA")
         w_img, h_img = img.size
         rango = y_fin - y_ini
         for field in fields:
             try:
-                fid  = str(field.get("id", ""))
+                fid = str(field.get("id", ""))
                 tipo = str(field.get("tipo", "texto")).lower()
                 x = float(field.get("x", 0))
                 y = float(field.get("y", 0))
@@ -146,11 +140,11 @@ class GeminiVisionService:
                     continue
                 x1_px = int((x / 1000) * w_img)
                 x2_px = int(((x + fw) / 1000) * w_img)
-                y_rel  = (y - y_ini) / rango
+                y_rel = (y - y_ini) / rango
                 y2_rel = ((y + fh) - y_ini) / rango
-                y1_px  = int(y_rel  * h_img)
-                y2_px  = int(y2_rel * h_img)
-                cy_px  = (y1_px + y2_px) // 2
+                y1_px = int(y_rel * h_img)
+                y2_px = int(y2_rel * h_img)
+                cy_px = (y1_px + y2_px) // 2
                 if tipo == "checkbox":
                     cx_px = (x1_px + x2_px) // 2
                     r = 3
@@ -164,20 +158,20 @@ class GeminiVisionService:
                 continue
         return img.convert("RGB")
 
+    # ------------------------------------------------------------------
+    # UTILIDADES DE COORDENADAS
+    # ------------------------------------------------------------------
+
     def _calcular_iou(self, boxA, boxB):
-        xA = max(boxA[0], boxB[0])
-        yA = max(boxA[1], boxB[1])
-        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
-        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+        xA, yA = max(boxA[0], boxB[0]), max(boxA[1], boxB[1])
+        xB, yB = min(boxA[0] + boxA[2], boxB[0] + boxB[2]), min(boxA[1] + boxA[3], boxB[1] + boxB[3])
         interArea = max(0, xB - xA) * max(0, yB - yA)
         if interArea == 0:
             return 0.0
         boxAArea = boxA[2] * boxA[3]
         boxBArea = boxB[2] * boxB[3]
         union = float(boxAArea + boxBArea - interArea)
-        if union <= 0:
-            return 0.0
-        return interArea / union
+        return interArea / union if union > 0 else 0.0
 
     def _resolver_colisiones(self, fields_detectados, umbral_iou=0.10):
         campos_validos = []
@@ -186,26 +180,18 @@ class GeminiVisionService:
                 return float(f.get("w", 0) or 0) * float(f.get("h", 0) or 0)
             except (TypeError, ValueError):
                 return 0.0
-
         fields_ordenados = sorted(fields_detectados, key=_area_key, reverse=True)
-
         def _box(f):
             try:
-                return [
-                    float(f.get("x", 0) or 0),
-                    float(f.get("y", 0) or 0),
-                    float(f.get("w", 0) or 0),
-                    float(f.get("h", 0) or 0),
-                ]
+                return [float(f.get("x", 0) or 0), float(f.get("y", 0) or 0),
+                        float(f.get("w", 0) or 0), float(f.get("h", 0) or 0)]
             except (TypeError, ValueError):
                 return [0.0, 0.0, 0.0, 0.0]
-
         for actual in fields_ordenados:
             box_actual = _box(actual)
             colision = False
             for aprobado in campos_validos:
-                box_aprobado = _box(aprobado)
-                if self._calcular_iou(box_actual, box_aprobado) > umbral_iou:
+                if self._calcular_iou(box_actual, _box(aprobado)) > umbral_iou:
                     colision = True
                     break
             if not colision:
@@ -234,8 +220,7 @@ class GeminiVisionService:
             fid = campo.get("id")
             if not fid:
                 continue
-            w = campo.get("w", 0)
-            h = campo.get("h", 0)
+            w, h = campo.get("w", 0), campo.get("h", 0)
             if w == 0 and h == 0:
                 if fid not in mapa:
                     mapa[fid] = campo
@@ -255,6 +240,10 @@ class GeminiVisionService:
         bottom = int((y_fin / 1000) * h)
         return image_pil.crop((0, top, w, bottom))
 
+    # ------------------------------------------------------------------
+    # LLAMADAS A GEMINI
+    # ------------------------------------------------------------------
+
     def _llamar_gemini(self, imagen_pil, prompt, retries=3, delay=2, model_id=None):
         model = model_id or self.model_id_vision
         for attempt in range(1, retries + 1):
@@ -271,7 +260,39 @@ class GeminiVisionService:
                 else:
                     raise
 
-    def _construir_prompt(self, expected_fields, y_ini, y_fin):
+    def _llamar_gemini_structured(self, pdf_bytes, prompt, retries=3, delay=2):
+        for attempt in range(1, retries + 1):
+            try:
+                return self.client.models.generate_content(
+                    model=self.model_id,
+                    contents=[
+                        types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                        prompt,
+                    ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=MappingResponse,
+                        temperature=0,
+                    ),
+                )
+            except Exception as e:
+                err = str(e)
+                if ("503" in err or "UNAVAILABLE" in err.upper()) and attempt < retries:
+                    print(f"[Gemini Structured] 503 (intento {attempt}/{retries}). Reintentando en {delay}s...")
+                    time.sleep(delay)
+                else:
+                    raise
+
+    # ------------------------------------------------------------------
+    # PROMPTS
+    # ------------------------------------------------------------------
+
+    def _construir_prompt(self, expected_fields, y_ini, y_fin, font_size_pt=9.0):
+    # Calcular proporciones dinámicas basadas en el tamaño de la letra
+        alto_min = round(font_size_pt + 1.0, 1)
+        alto_max = round(font_size_pt + 1.5, 1)
+        check_size = round(font_size_pt + 1.0, 1)
+
         return f"""
 ROL: Eres un sistema OCR especializado en formularios en papel.
 Tu ÚNICA función es localizar zonas VACÍAS de escritura, no texto impreso.
@@ -288,6 +309,14 @@ La grilla muestra coordenadas ABSOLUTAS reales:
 Usa los números de la grilla directamente.
 NUNCA reportes Y fuera de {y_ini}-{y_fin}.
 NUNCA reportes X fuera de 0-1000.
+
+═══════════════════════════════════════════════════════════
+TAMAÑO DE FUENTE DETECTADO: {font_size_pt}pt
+═══════════════════════════════════════════════════════════
+El formulario usa letra de {font_size_pt}pt. Ajusta el alto de los campos así:
+  → Alto mínimo: {alto_min}
+  → Alto máximo: {alto_max}
+  → Checkbox: {check_size} de lado
 
 ═══════════════════════════════════════════════════════════
 REGLA DE EXCLUSIÓN ESPACIAL (¡CRÍTICO!)
@@ -321,23 +350,22 @@ Para cada campo:
   [4] ¿Las coordenadas caen en espacio blanco? → Sí: reporta. No: corrige.
 
 ═══════════════════════════════════════════════════════════
-REGLAS POR TIPO
+REGLAS POR TIPO (AJUSTADAS A {font_size_pt}pt)
 ═══════════════════════════════════════════════════════════
 CHECKBOXES:
   → x1,y1 = esquina superior izquierda de la figura vacía.
   → x2,y2 = esquina inferior derecha.
-  → Ancho y Alto entre 12-20. Nunca más de 22.
+  → Ancho y Alto entre {check_size}-{check_size + 4}. Nunca más de 22.
   → Grupo en fila → mismo 'y1', distinto 'x1'.
 
 FECHAS:
   → 3 campos separados, mismo 'y1', distinto 'x1'.
-  → dd: ancho 30-50 | mm: ancho 30-50 | aaaa: ancho 60-90 | alto: 10-16.
-  → 'y2' toca la línea base.
+  → dd: ancho 30-50 | mm: ancho 30-50 | aaaa: ancho 60-90 | alto: {alto_min}-{alto_max}.
 
-TEXTO CORTO:   ancho 30-80,   alto 10-18
-TEXTO MEDIO:   ancho 80-350,  alto 10-20
-TEXTO LARGO:   ancho 300-970, alto 10-22
-NÚMERO:        ancho 50-200,  alto 10-18
+TEXTO CORTO:   ancho 30-80,   alto {alto_min}-{alto_max}
+TEXTO MEDIO:   ancho 80-350,  alto {alto_min}-{alto_max}
+TEXTO LARGO:   ancho 300-970, alto {alto_min}-{alto_max}
+NÚMERO:        ancho 50-200,  alto {alto_min}-{alto_max}
 
 LÍNEAS DIVISORIAS:
   → Si ves una línea fina entre dos campos, NO es un campo.
@@ -347,14 +375,14 @@ LÍNEAS DIVISORIAS:
 ALINEACIÓN
 ═══════════════════════════════════════════════════════════
   → Misma fila → mismo 'y1' (±5), distinto 'x1'.
-  → Filas distintas → 'y1' diferente (mínimo 10 unidades).
+  → Filas distintas → 'y1' diferente (mínimo {alto_min + 2} unidades).
   → Nunca 'x2' > 1000. Nunca 'y2' > {y_fin}.
 
 ═══════════════════════════════════════════════════════════
 AUTO-REVISIÓN
 ═══════════════════════════════════════════════════════════
   [A] ¿Algún campo sobre texto en negrita o bloques grises? → muévelo al vacío.
-  [B] ¿Checkbox con ancho o alto > 22? → reduce a 20.
+  [B] ¿Checkbox con ancho o alto > 22? → reduce a {check_size}.
   [C] ¿Dos campos con mismo 'y1'? → corrige el segundo.
   [D] ¿'x2'>1000 o 'y2'>{y_fin}? → recorta.
   [E] ¿Y fuera de {y_ini}-{y_fin}? → corrige o descarta.
@@ -367,18 +395,18 @@ EJEMPLOS
   [1] "Ciudad" en negrita → etiqueta.
   [2] Debajo: espacio blanco con línea fina.
   [3] Vacío ✓  [4] Blanco ✓
-  → x1:248, y1:128, x2:470, y2:153
+  → x1:248, y1:128, x2:470, y2:{128 + alto_min}
 
 'solicitud_nuevo_chk':
   [1] "Nuevo" a la izquierda → etiqueta.
   [2] A la derecha: cuadro pequeño con borde.
   [3] Vacío ✓  [4] Blanco ✓
-  → x1:574, y1:148, x2:591, y2:165
+  → x1:574, y1:148, x2:{574 + check_size}, y2:{148 + check_size}
 
-RESPONDE SOLO JSON sin markdown:
+RESPONDE SOLO JSON sin markdown con fontSize={font_size_pt}:
 {{
   "fields": [
-    {{"id":"nombre","tipo":"texto","x1":100,"y1":200,"x2":250,"y2":214,"fontSize":9,"align":"left"}}
+    {{"id":"nombre","tipo":"texto","x1":100,"y1":200,"x2":250,"y2":{200 + alto_min},"fontSize":{font_size_pt},"align":"left"}}
   ]
 }}
 """
@@ -415,30 +443,12 @@ RESPONDE SOLO JSON sin markdown:
   ]
 }}
 """
-    def _llamar_gemini_structured(self, pdf_bytes, prompt, retries=3, delay=2):
-        """Reintentos para llamadas con structured output."""
-        for attempt in range(1, retries + 1):
-            try:
-                return self.client.models.generate_content(
-                    model=self.model_id,
-                    contents=[
-                        types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-                        prompt,
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=MappingResponse,
-                        temperature=0,
-                    ),
-                )
-            except Exception as e:
-                err = str(e)
-                if ("503" in err or "UNAVAILABLE" in err.upper()) and attempt < retries:
-                    print(f"[Gemini Structured] 503 (intento {attempt}/{retries}). Reintentando en {delay}s...")
-                    time.sleep(delay)
-                else:
-                    raise
-    def _procesar_por_franjas(self, image_pil, expected_fields, debug_dir, page_num):
+
+    # ------------------------------------------------------------------
+    # PROCESAMIENTO POR FRANJAS
+    # ------------------------------------------------------------------
+
+    def _procesar_por_franjas(self, image_pil, expected_fields, debug_dir, page_num, font_size_pt=9.0):
         todos = []
         for idx, (y_ini, y_fin) in enumerate(self.FRANJAS):
             print(f"[Gemini] Franja {idx+1}/{len(self.FRANJAS)} → y:{y_ini}-{y_fin}")
@@ -447,7 +457,7 @@ RESPONDE SOLO JSON sin markdown:
             recorte_con_grilla = self._enmascarar_areas_usadas(recorte_con_grilla, todos, y_ini, y_fin)
             Path(debug_dir).mkdir(parents=True, exist_ok=True)
             recorte_con_grilla.save(f"{debug_dir}/franja_{idx+1}_gemini_ve.png")
-            prompt = self._construir_prompt(expected_fields, y_ini, y_fin)
+            prompt = self._construir_prompt(expected_fields, y_ini, y_fin, font_size_pt)
             try:
                 response = self._llamar_gemini(recorte_con_grilla, prompt)
                 texto_raw = response.text if response else ""
@@ -506,10 +516,7 @@ RESPONDE SOLO JSON sin markdown:
     def _verificar_y_corregir_por_franjas(self, image_pil, fields_detectados, debug_dir, page_num):
         todos_corregidos = []
         for idx, (y_ini, y_fin) in enumerate(self.FRANJAS):
-            campos_franja = [
-                f for f in fields_detectados
-                if y_ini - 10 <= f.get("y", 0) <= y_fin + 10
-            ]
+            campos_franja = [f for f in fields_detectados if y_ini - 10 <= f.get("y", 0) <= y_fin + 10]
             if not campos_franja:
                 continue
             print(f"[Gemini][2pass] Franja {idx+1}: verificando {len(campos_franja)} campos.")
@@ -535,16 +542,13 @@ RESPONDE SOLO JSON sin markdown:
         )
         return resultado
 
-    def analyze_form_page(self, image_pil, expected_fields, page_num=None, debug_dir="temp"):
-        fields = self._procesar_por_franjas(image_pil, expected_fields, debug_dir, page_num)
-        # El two-pass se deja comentado por costo; se puede habilitar si se requiere más precisión
-        # fields = self._verificar_y_corregir_por_franjas(image_pil, fields, debug_dir, page_num)
+    def analyze_form_page(self, image_pil, expected_fields, page_num=None, debug_dir="temp", font_size_pt=9.0):
+        fields = self._procesar_por_franjas(image_pil, expected_fields, debug_dir, page_num, font_size_pt)
         print(f"[Gemini] Final: {len(fields)} campos.")
         return fields
 
     # ------------------------------------------------------------------
-    # NUEVO: Mapeo unificado con maestro usando structured output
-    # (sección 6 y 8 del documento de investigación)
+    # MAPEO CON MAESTRO
     # ------------------------------------------------------------------
 
     def map_fields_with_master(
@@ -555,27 +559,25 @@ RESPONDE SOLO JSON sin markdown:
         pdf_is_acroform: bool = False,
     ) -> MappingResponse:
         prompt = f"""Eres un asistente que mapea campos de un formulario PDF con los datos
-    de una base maestra. Tu único trabajo es decidir qué valor de la base maestra
-    corresponde a cada campo del formulario.
+de una base maestra. Tu único trabajo es decidir qué valor de la base maestra
+corresponde a cada campo del formulario.
 
-    REGLAS:
-    1. Solo asigna un valor si tienes alta confianza (>= 0.7) de que el campo
-    se refiere al mismo dato semántico (ej: "Razón Social", "Nombre Comercial",
-    "Denominación o Razón Social", "Empresa" → razon_social).
-    2. Si no hay coincidencia clara, asigna value=null y confidence=0.
-    3. Para fechas, normaliza al formato dd/mm/yyyy salvo que la etiqueta exija
-    otro formato explícito (ej: "Date (MM-DD-YYYY)").
-    4. Para checkboxes/radio buttons, value debe ser "true" o "false".
-    5. NO inventes valores que no estén en la base maestra.
-    6. Para cada campo asignado, incluye un razonamiento breve (reasoning).
-    7. Marca needs_human_review=true si confidence < 0.9.
+REGLAS:
+1. Solo asigna un valor si tienes alta confianza (>= 0.7) de que el campo
+   se refiere al mismo dato semántico.
+2. Si no hay coincidencia clara, asigna value=null y confidence=0.
+3. Para fechas, normaliza al formato dd/mm/yyyy.
+4. Para checkboxes/radio buttons, value debe ser "true" o "false".
+5. NO inventes valores que no estén en la base maestra.
+6. Para cada campo asignado, incluye un razonamiento breve (reasoning).
+7. Marca needs_human_review=true si confidence < 0.9.
 
-    BASE MAESTRA (única fuente de verdad):
-    {json.dumps(master_data, ensure_ascii=False, indent=2)}
+BASE MAESTRA:
+{json.dumps(master_data, ensure_ascii=False, indent=2)}
 
-    CAMPOS DEL FORMULARIO A MAPEAR:
-    {json.dumps(extracted_fields, ensure_ascii=False, indent=2)}
-    """
+CAMPOS DEL FORMULARIO A MAPEAR:
+{json.dumps(extracted_fields, ensure_ascii=False, indent=2)}
+"""
         try:
             response = self._llamar_gemini_structured(pdf_bytes, prompt)
             result: MappingResponse = response.parsed
